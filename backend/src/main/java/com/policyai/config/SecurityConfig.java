@@ -34,6 +34,7 @@ public class SecurityConfig {
             .csrf(AbstractHttpConfigurer::disable)
             .sessionManagement(s -> s.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
             .authorizeHttpRequests(auth -> auth
+                .dispatcherTypeMatchers(jakarta.servlet.DispatcherType.ASYNC).permitAll()
                 // Public auth endpoints
                 .requestMatchers("/api/auth/**").permitAll()
                 // H2 console (development only)
