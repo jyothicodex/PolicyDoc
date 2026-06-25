@@ -231,6 +231,8 @@ public class ChatService {
                     if (messageMap != null) {
                         answer = (String) messageMap.get("content");
                         if (answer == null) answer = "I'm sorry, I could not generate a response.";
+                    } else if (aiResponseMap.containsKey("error")) {
+                        answer = (String) aiResponseMap.get("error");
                     } else {
                         answer = "I'm sorry, the AI service encountered an error and could not generate a response.";
                     }

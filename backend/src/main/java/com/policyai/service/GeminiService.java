@@ -169,7 +169,13 @@ public class GeminiService {
                 return result;
             }
         } catch (Exception e) {
+            if (e instanceof org.springframework.web.client.HttpClientErrorException) {
+                org.springframework.web.client.HttpClientErrorException clientError = (org.springframework.web.client.HttpClientErrorException) e;
+                log.error("Gemini API Client Error: {}", clientError.getResponseBodyAsString());
+                return Map.of("error", "Gemini API Error: " + clientError.getResponseBodyAsString());
+            }
             log.error("Error calling Gemini API chat: {}", e.getMessage(), e);
+            return Map.of("error", e.getMessage());
         }
         return new HashMap<>();
     }
