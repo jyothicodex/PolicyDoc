@@ -1,16 +1,15 @@
 package com.policyai.service;
 
-import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
-import org.springframework.http.*;
 import org.springframework.stereotype.Service;
-import org.springframework.web.client.RestTemplate;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
-import java.io.BufferedReader;
-import java.io.InputStreamReader;
+import com.google.genai.Client;
+import com.google.genai.types.*;
+
+import jakarta.annotation.PostConstruct;
 import java.util.*;
 import java.util.function.Consumer;
 
@@ -18,15 +17,22 @@ import java.util.function.Consumer;
 @Slf4j
 public class GeminiService {
 
-    private final RestTemplate restTemplate;
     private final ObjectMapper objectMapper;
 
     @Value("${app.gemini.api-key}")
     private String apiKey;
 
-    public GeminiService(RestTemplate restTemplate) {
-        this.restTemplate = restTemplate;
+    private Client client;
+
+    public GeminiService() {
         this.objectMapper = new ObjectMapper();
+    }
+
+    @PostConstruct
+    public void init() {
+        if (isAvailable()) {
+            this.client = Client.builder().apiKey(apiKey).build();
+        }
     }
 
     public boolean isAvailable() {
@@ -36,27 +42,17 @@ public class GeminiService {
     public double[] getEmbedding(String text) {
         if (!isAvailable()) return new double[0];
         
-        String url = "https://generativelanguage.googleapis.com/v1beta/models/text-embedding-004:embedContent?key=" + apiKey;
-        Map<String, Object> requestBody = new HashMap<>();
-        requestBody.put("model", "models/text-embedding-004");
-        requestBody.put("content", Map.of("parts", List.of(Map.of("text", text))));
-
-        HttpHeaders headers = new HttpHeaders();
-        headers.setContentType(MediaType.APPLICATION_JSON);
-        HttpEntity<Map<String, Object>> request = new HttpEntity<>(requestBody, headers);
-
         try {
-            ResponseEntity<String> response = restTemplate.exchange(url, HttpMethod.POST, request, String.class);
-            if (response.getStatusCode().is2xxSuccessful() && response.getBody() != null) {
-                JsonNode jsonNode = objectMapper.readTree(response.getBody());
-                JsonNode embeddingNode = jsonNode.path("embedding").path("values");
-                if (embeddingNode.isArray()) {
-                    double[] embedding = new double[embeddingNode.size()];
-                    for (int i = 0; i < embeddingNode.size(); i++) {
-                        embedding[i] = embeddingNode.get(i).asDouble();
-                    }
-                    return embedding;
+            Content content = Content.builder().parts(List.of(Part.builder().text(text).build())).build();
+            EmbedContentResponse response = client.models.embedContent("gemini-embedding-2", content, EmbedContentConfig.builder().build());
+            
+            if (response.embeddings() != null && response.embeddings().isPresent() && !response.embeddings().get().isEmpty()) {
+                List<Float> values = response.embeddings().get().get(0).values().get();
+                double[] embedding = new double[values.size()];
+                for (int i = 0; i < values.size(); i++) {
+                    embedding[i] = values.get(i);
                 }
+                return embedding;
             }
         } catch (Exception e) {
             log.error("Error generating embeddings: {}", e.getMessage(), e);
@@ -77,26 +73,13 @@ public class GeminiService {
     private String callGeminiGenerate(String prompt) {
         if (!isAvailable()) return "{}";
         
-        String url = "https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key=" + apiKey;
-        
-        Map<String, Object> requestBody = new HashMap<>();
-        requestBody.put("contents", List.of(
-            Map.of("parts", List.of(Map.of("text", prompt)))
-        ));
-
-        HttpHeaders headers = new HttpHeaders();
-        headers.setContentType(MediaType.APPLICATION_JSON);
-        HttpEntity<Map<String, Object>> request = new HttpEntity<>(requestBody, headers);
-
         try {
-            ResponseEntity<String> response = restTemplate.exchange(url, HttpMethod.POST, request, String.class);
-            if (response.getStatusCode().is2xxSuccessful() && response.getBody() != null) {
-                JsonNode jsonNode = objectMapper.readTree(response.getBody());
-                JsonNode partsNode = jsonNode.path("candidates").get(0).path("content").path("parts");
-                if (partsNode.isArray() && partsNode.size() > 0) {
-                    return cleanJsonResponse(partsNode.get(0).path("text").asText());
-                }
-            }
+            GenerateContentResponse response = client.models.generateContent(
+                "gemini-2.5-flash", 
+                prompt,
+                GenerateContentConfig.builder().build()
+            );
+            return cleanJsonResponse(response.text());
         } catch (Exception e) {
             log.error("Error calling Gemini API: {}", e.getMessage(), e);
         }
@@ -106,78 +89,74 @@ public class GeminiService {
     public Map<String, Object> chatWithTools(List<Map<String, Object>> messages, List<Map<String, Object>> tools) {
         if (!isAvailable()) return new HashMap<>();
 
-        String url = "https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key=" + apiKey;
-        
-        List<Map<String, Object>> geminiContents = convertMessagesToGeminiFormat(messages);
-        Map<String, Object> requestBody = new HashMap<>();
-        requestBody.put("contents", geminiContents);
-
-        // Define tools for Gemini if present
-        if (tools != null && !tools.isEmpty()) {
-            List<Map<String, Object>> functionDeclarations = new ArrayList<>();
-            for (Map<String, Object> tool : tools) {
-                Map<String, Object> function = (Map<String, Object>) tool.get("function");
-                Map<String, Object> params = (Map<String, Object>) function.get("parameters");
-                // We assume types are already uppercase (OBJECT, STRING, etc.) in the tool definition
-                
-                Map<String, Object> funcDecl = new HashMap<>();
-                funcDecl.put("name", function.get("name"));
-                funcDecl.put("description", function.get("description"));
-                funcDecl.put("parameters", params);
-                functionDeclarations.add(funcDecl);
-            }
-            requestBody.put("tools", List.of(Map.of("functionDeclarations", functionDeclarations)));
-        }
-
-        HttpHeaders headers = new HttpHeaders();
-        headers.setContentType(MediaType.APPLICATION_JSON);
-        HttpEntity<Map<String, Object>> request = new HttpEntity<>(requestBody, headers);
-
         try {
-            ResponseEntity<String> response = restTemplate.exchange(url, HttpMethod.POST, request, String.class);
-            if (response.getStatusCode().is2xxSuccessful() && response.getBody() != null) {
-                JsonNode jsonNode = objectMapper.readTree(response.getBody());
-                JsonNode candidate = jsonNode.path("candidates").get(0);
-                JsonNode content = candidate.path("content");
-                JsonNode parts = content.path("parts");
+            List<Content> contents = convertMessagesToGeminiFormat(messages);
+            GenerateContentConfig.Builder configBuilder = GenerateContentConfig.builder();
 
-                // Parse response back to our universal format
-                Map<String, Object> messageMap = new HashMap<>();
-                
-                if (parts.isArray() && parts.size() > 0) {
-                    JsonNode part = parts.get(0);
-                    if (part.has("text")) {
-                        messageMap.put("content", part.get("text").asText());
-                    } else if (part.has("functionCall")) {
-                        // Handle function call
-                        JsonNode functionCall = part.get("functionCall");
-                        Map<String, Object> toolCall = new HashMap<>();
-                        toolCall.put("id", "call_" + UUID.randomUUID().toString().substring(0, 8));
-                        toolCall.put("type", "function");
-                        
-                        Map<String, Object> functionParams = new HashMap<>();
-                        functionParams.put("name", functionCall.get("name").asText());
-                        functionParams.put("arguments", objectMapper.convertValue(functionCall.get("args"), Map.class));
-                        toolCall.put("function", functionParams);
-
-                        messageMap.put("tool_calls", List.of(toolCall));
+            if (tools != null && !tools.isEmpty()) {
+                List<FunctionDeclaration> functionDeclarations = new ArrayList<>();
+                for (Map<String, Object> tool : tools) {
+                    Map<String, Object> function = (Map<String, Object>) tool.get("function");
+                    Map<String, Object> params = (Map<String, Object>) function.get("parameters");
+                    
+                    Schema.Builder schemaBuilder = Schema.builder().type(((String)params.get("type")).toLowerCase());
+                    
+                    if (params.containsKey("properties")) {
+                        Map<String, Map<String, String>> props = (Map<String, Map<String, String>>) params.get("properties");
+                        Map<String, Schema> schemaProps = new HashMap<>();
+                        for (Map.Entry<String, Map<String, String>> entry : props.entrySet()) {
+                            schemaProps.put(
+                                entry.getKey(), 
+                                Schema.builder()
+                                      .type(entry.getValue().get("type").toLowerCase())
+                                      .description(entry.getValue().get("description"))
+                                      .build()
+                            );
+                        }
+                        schemaBuilder.properties(schemaProps);
                     }
-                }
+                    if (params.containsKey("required")) {
+                        List<String> required = (List<String>) params.get("required");
+                        schemaBuilder.required(required);
+                    }
 
-                Map<String, Object> result = new HashMap<>();
-                result.put("message", messageMap);
-                return result;
+                    FunctionDeclaration funcDecl = FunctionDeclaration.builder()
+                        .name((String) function.get("name"))
+                        .description((String) function.get("description"))
+                        .parameters(schemaBuilder.build())
+                        .build();
+                        
+                    functionDeclarations.add(funcDecl);
+                }
+                configBuilder.tools(List.of(Tool.builder().functionDeclarations(functionDeclarations).build()));
             }
+
+            GenerateContentResponse response = client.models.generateContent("gemini-2.5-flash", contents, configBuilder.build());
+
+            Map<String, Object> messageMap = new HashMap<>();
+            
+            if (response.text() != null) {
+                messageMap.put("content", response.text());
+            } else if (response.functionCalls() != null && !response.functionCalls().isEmpty()) {
+                FunctionCall functionCall = response.functionCalls().get(0);
+                Map<String, Object> toolCall = new HashMap<>();
+                toolCall.put("id", "call_" + UUID.randomUUID().toString().substring(0, 8));
+                toolCall.put("type", "function");
+                
+                Map<String, Object> functionParams = new HashMap<>();
+                functionParams.put("name", functionCall.name());
+                // Handle arguments Map. Convert values to strings or maps if needed
+                functionParams.put("arguments", functionCall.args() != null && functionCall.args().isPresent() ? functionCall.args().get() : new HashMap<>());
+                toolCall.put("function", functionParams);
+
+                messageMap.put("tool_calls", List.of(toolCall));
+            }
+
+            return Map.of("message", messageMap);
         } catch (Exception e) {
-            if (e instanceof org.springframework.web.client.HttpClientErrorException) {
-                org.springframework.web.client.HttpClientErrorException clientError = (org.springframework.web.client.HttpClientErrorException) e;
-                log.error("Gemini API Client Error: {}", clientError.getResponseBodyAsString());
-                return Map.of("error", "Gemini API Error: " + clientError.getResponseBodyAsString());
-            }
             log.error("Error calling Gemini API chat: {}", e.getMessage(), e);
             return Map.of("error", e.getMessage());
         }
-        return new HashMap<>();
     }
 
     public void streamChat(List<Map<String, Object>> messages, SseEmitter emitter, Consumer<String> onComplete) {
@@ -186,138 +165,115 @@ public class GeminiService {
             return;
         }
 
-        String url = "https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:streamGenerateContent?alt=sse&key=" + apiKey;
-        
-        List<Map<String, Object>> geminiContents = convertMessagesToGeminiFormat(messages);
-        Map<String, Object> requestBody = new HashMap<>();
-        requestBody.put("contents", geminiContents);
-
-        restTemplate.execute(url, HttpMethod.POST, request -> {
-            request.getHeaders().setContentType(MediaType.APPLICATION_JSON);
-            request.getBody().write(objectMapper.writeValueAsBytes(requestBody));
-        }, response -> {
+        try {
+            List<Content> contents = convertMessagesToGeminiFormat(messages);
+            Iterable<GenerateContentResponse> stream = client.models.generateContentStream("gemini-2.5-flash", contents, GenerateContentConfig.builder().build());
+            
             StringBuilder fullResponse = new StringBuilder();
             boolean clientDisconnected = false;
-            try (BufferedReader reader = new BufferedReader(new InputStreamReader(response.getBody()))) {
-                String line;
-                while ((line = reader.readLine()) != null) {
-                    if (line.startsWith("data: ")) {
-                        String data = line.substring(6).trim();
-                        if (data.isEmpty()) continue;
-                        
-                        JsonNode node = objectMapper.readTree(data);
-                        JsonNode partsNode = node.path("candidates").get(0).path("content").path("parts");
-                        if (partsNode.isArray() && partsNode.size() > 0) {
-                            JsonNode textNode = partsNode.get(0).path("text");
-                            if (!textNode.isMissingNode()) {
-                                String chunk = textNode.asText();
-                                fullResponse.append(chunk);
-                                if (!clientDisconnected) {
-                                    try {
-                                        emitter.send(SseEmitter.event().data(chunk));
-                                    } catch (Exception ex) {
-                                        clientDisconnected = true;
-                                    }
-                                }
-                            }
+            
+            for (GenerateContentResponse chunk : stream) {
+                if (chunk.text() != null) {
+                    fullResponse.append(chunk.text());
+                    if (!clientDisconnected) {
+                        try {
+                            emitter.send(SseEmitter.event().data(chunk.text()));
+                        } catch (Exception ex) {
+                            clientDisconnected = true;
                         }
                     }
                 }
-                if (onComplete != null) {
-                    onComplete.accept(fullResponse.toString());
-                }
-                if (!clientDisconnected) {
-                    try {
-                        emitter.send(SseEmitter.event().name("done").data("[DONE]"));
-                        emitter.complete();
-                    } catch (Exception ignored) {}
-                }
-            } catch (Exception e) {
-                log.error("Error reading stream from Gemini", e);
-                if (!clientDisconnected) {
-                    emitter.completeWithError(e);
-                }
             }
-            return null;
-        });
+            
+            if (onComplete != null) {
+                onComplete.accept(fullResponse.toString());
+            }
+            if (!clientDisconnected) {
+                try {
+                    emitter.send(SseEmitter.event().name("done").data("[DONE]"));
+                    emitter.complete();
+                } catch (Exception ignored) {}
+            }
+            
+        } catch (Exception e) {
+            log.error("Error reading stream from Gemini", e);
+            emitter.completeWithError(e);
+        }
     }
 
-    private List<Map<String, Object>> convertMessagesToGeminiFormat(List<Map<String, Object>> messages) {
-        List<Map<String, Object>> geminiContents = new ArrayList<>();
+    private List<Content> convertMessagesToGeminiFormat(List<Map<String, Object>> messages) {
+        List<Content> contents = new ArrayList<>();
         StringBuilder systemInstruction = new StringBuilder();
 
         for (Map<String, Object> msg : messages) {
             String role = (String) msg.get("role");
-            String content = (String) msg.get("content");
+            String text = (String) msg.get("content");
 
             if ("system".equals(role)) {
-                systemInstruction.append(content).append("\n");
+                systemInstruction.append(text).append("\n");
                 continue;
             }
 
             if ("tool".equals(role)) {
-                // Map tool response to Gemini format
                 String name = (String) msg.get("name");
-                geminiContents.add(Map.of(
-                    "role", "function",
-                    "parts", List.of(Map.of(
-                        "functionResponse", Map.of(
-                            "name", name,
-                            "response", Map.of("result", content)
-                        )
-                    ))
-                ));
+                contents.add(Content.builder()
+                    .role("function")
+                    .parts(List.of(Part.builder()
+                        .functionResponse(FunctionResponse.builder()
+                            .name(name)
+                            .response(Map.of("result", text))
+                            .build())
+                        .build()))
+                    .build());
                 continue;
             }
 
             String geminiRole = "user".equals(role) ? "user" : "model";
-            List<Map<String, Object>> parts = new ArrayList<>();
+            List<Part> parts = new ArrayList<>();
             
-            if (content != null && !content.isEmpty()) {
-                parts.add(Map.of("text", content));
+            if (text != null && !text.isEmpty()) {
+                parts.add(Part.builder().text(text).build());
             }
 
             if (msg.containsKey("tool_calls")) {
                 List<Map<String, Object>> toolCalls = (List<Map<String, Object>>) msg.get("tool_calls");
                 for (Map<String, Object> tc : toolCalls) {
                     Map<String, Object> function = (Map<String, Object>) tc.get("function");
-                    parts.add(Map.of(
-                        "functionCall", Map.of(
-                            "name", function.get("name"),
-                            "args", function.get("arguments")
-                        )
-                    ));
+                    parts.add(Part.builder()
+                        .functionCall(FunctionCall.builder()
+                            .name((String)function.get("name"))
+                            .args((Map<String, Object>)function.get("arguments"))
+                            .build())
+                        .build());
                 }
             }
 
             if (!parts.isEmpty()) {
-                geminiContents.add(Map.of("role", geminiRole, "parts", parts));
+                contents.add(Content.builder().role(geminiRole).parts(parts).build());
             }
         }
 
-        // If there are system instructions, we prepend them to the first user message
-        // since basic generateContent prefers this if we don't explicitly define system_instruction structure.
         if (systemInstruction.length() > 0) {
-            if (geminiContents.isEmpty()) {
-                geminiContents.add(Map.of("role", "user", "parts", List.of(Map.of("text", systemInstruction.toString()))));
+            if (contents.isEmpty()) {
+                contents.add(Content.builder().role("user").parts(List.of(Part.builder().text(systemInstruction.toString()).build())).build());
             } else {
-                Map<String, Object> firstMsg = geminiContents.get(0);
-                if ("user".equals(firstMsg.get("role"))) {
-                    List<Map<String, Object>> parts = new ArrayList<>((List<Map<String, Object>>) firstMsg.get("parts"));
-                    Map<String, Object> firstPart = parts.get(0);
-                    if (firstPart.containsKey("text")) {
-                        parts.set(0, Map.of("text", systemInstruction.toString() + "\n\n" + firstPart.get("text")));
+                Content firstMsg = contents.get(0);
+                if ("user".equals(firstMsg.role())) {
+                    List<Part> parts = new ArrayList<>(firstMsg.parts().isPresent() ? firstMsg.parts().get() : new ArrayList<>());
+                    if (!parts.isEmpty()) {
+                        Part firstPart = parts.get(0);
+                        if (firstPart.text() != null) {
+                            parts.set(0, Part.builder().text(systemInstruction.toString() + "\n\n" + firstPart.text()).build());
+                        }
                     }
-                    Map<String, Object> newFirstMsg = new HashMap<>(firstMsg);
-                    newFirstMsg.put("parts", parts);
-                    geminiContents.set(0, newFirstMsg);
+                    contents.set(0, Content.builder().role("user").parts(parts).build());
                 } else {
-                    geminiContents.add(0, Map.of("role", "user", "parts", List.of(Map.of("text", systemInstruction.toString()))));
+                    contents.add(0, Content.builder().role("user").parts(List.of(Part.builder().text(systemInstruction.toString()).build())).build());
                 }
             }
         }
         
-        return geminiContents;
+        return contents;
     }
 
     private String buildSummaryPrompt(String documentText, String documentName) {
